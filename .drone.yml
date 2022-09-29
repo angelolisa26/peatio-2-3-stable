@@ -1,0 +1,171 @@
+kind: pipeline
+name: default
+
+services:
+- name: database
+  image: mysql:5.7
+  ports:
+    - 3306
+  environment:
+    MYSQL_ALLOW_EMPTY_PASSWORD: 'yes'
+
+- name: rabbitmq
+  image: rabbitmq:3.7.6-management
+  ports:
+    - 5672
+
+- name: redis
+  image: redis:4.0
+  ports:
+    - 6379
+
+steps:
+# Wait MySQL to be ready for taking connections.
+- name: wait-for-mysql
+  image: jwilder/dockerize
+  commands:
+  - dockerize -wait tcp://database:3306 -timeout 1m
+
+# Initialize application. Install dependencies. Migrate database. Run rspec.
+- name: run-rspec
+  image: ruby:2.6.5
+  environment:
+    DATABASE_HOST: database
+    RABBITMQ_HOST: rabbitmq
+    EVENT_API_RABBITMQ_HOST: rabbitmq
+    REDIS_URL: redis://redis:6379
+    RAILS_ENV: test
+  commands:
+    - bin/init_config
+    - bundle install --jobs=$(nproc) --retry=3 --path vendor/bundle
+    - bundle exec rake db:create db:migrate
+    - LOG_LEVEL=warn bundle exec rspec
+
+# Update application version, markdown and swagger documentation, then push it to git repository.
+- name: git-tag-and-push
+  image: quay.io/openware/sdk-citools:2.3.1
+  environment:
+    BOT_USERNAME: kite-bot
+    BOT_NAME: Kite Bot
+    BOT_EMAIL: kite-bot@heliostech.fr
+    BRANCH_NAME: ${DRONE_BRANCH}
+    REPO_NAME: ${DRONE_REPO}
+    GITHUB_API_KEY:
+      from_secret: kite_bot_key
+  commands:
+    - BUNDLE_GEMFILE=/sdk/Gemfile bundle exec rake --rakefile=/sdk/Rakefile ci:prebuild
+  when:
+    branch:
+      - master
+      - 2-0-stable
+      - 2-1-stable
+      - 2-2-stable
+      - 2-3-stable
+
+# Copy bundler cache from the build environment to your host machine.
+# Plugin description: http://plugins.drone.io/drillster/drone-volume-cache
+- name: rebuild-bundle-cache
+  pull: default
+  image: drillster/drone-volume-cache
+  settings:
+    rebuild: true
+    mount:
+    - vendor/bundle
+  volumes:
+  - name: bundle-cache
+    path: /cache
+
+# Copy docker cache from the host machine to your build environment.
+# Plugin description: http://plugins.drone.io/drillster/drone-volume-cache
+- name: restore-docker-cache
+  pull: default
+  image: drillster/drone-volume-cache
+  settings:
+    restore: true
+    mount:
+    - /drone/docker
+  volumes:
+  - name: docker-cache
+    path: /cache
+  when:
+    branch:
+      - master
+
+# Build and push docker image using ".tags" file.
+- name: docker-build-and-push
+  image: plugins/docker
+  settings:
+    username:
+      from_secret: quay_username
+    password:
+      from_secret: quay_password
+    repo: quay.io/openware/peatio
+    registry: quay.io
+  when:
+    branch:
+      - master
+      - 2-0-stable
+      - 2-1-stable
+      - 2-2-stable
+      - 2-3-stable
+
+# Update changelog and API documentation, then push it to sdk repository and notify.
+- name: push-and-notify
+  image: quay.io/openware/sdk-citools:2.3.1
+  environment:
+    BOT_USERNAME: kite-bot
+    BOT_NAME: Kite Bot
+    BOT_EMAIL: kite-bot@heliostech.fr
+    REPO_NAME: ${DRONE_REPO}
+    BRANCH_NAME: ${DRONE_BRANCH}
+    SDK_BRANCH: ${DRONE_BRANCH}
+    TELEGRAM_BOT_TOKEN:
+      from_secret: telegram_bot_token
+    TELEGRAM_CHAT_ID:
+      from_secret: telegram_chat_id
+    SLACK_TOKEN:
+      from_secret: slack_token
+    SLACK_CHANNEL:
+      from_secret: slack_channel
+    GITHUB_API_KEY:
+      from_secret: kite_bot_key
+  commands:
+    - BUNDLE_GEMFILE=/sdk/Gemfile bundle exec rake --rakefile=/sdk/Rakefile ci:postbuild[/drone/src]
+  when:
+    branch:
+      - master
+      - 2-0-stable
+      - 2-1-stable
+      - 2-2-stable
+      - 2-3-stable
+
+# Copy docker cache from the build environment to your host machine.
+# Plugin description: http://plugins.drone.io/drillster/drone-volume-cache
+- name: rebuild-docker-cache
+  pull: default
+  image: drillster/drone-volume-cache
+  settings:
+    rebuild: true
+    mount:
+    - /drone/docker
+  volumes:
+  - name: docker-cache
+    path: /cache
+  when:
+    branch:
+    - master
+
+volumes:
+- name: bundle-cache
+  host:
+    path: /tmp/bundle
+- name: docker-cache
+  host:
+    path: /tmp/docker
+
+trigger:
+  event:
+    - push
+
+image_pull_secrets:
+  - dockerconfigjson
